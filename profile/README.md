@@ -54,6 +54,6 @@ Our client work lives in private repositories. What you see here is intentionall
 
 **Let's build something.**
 
-[atomicglue.co](https://atomicglue.co) &nbsp;·&nbsp; Brookfield, Wisconsin
+[atomicglue.co](https://atomicglue.co) &nbsp;·&nbsp; Milwaukee, Wisconsin
 
 </div>
