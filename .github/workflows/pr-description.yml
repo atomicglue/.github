@@ -1,0 +1,111 @@
+name: PR description
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  describe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fill PR description from the diff
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+          MODEL: anthropic/claude-sonnet-5.5
+          MAX_DIFF_CHARS: "120000"
+        run: |
+          python3 - <<'PY'
+          import json, os, re, subprocess, sys, urllib.request
+
+          def gh(*args):
+              return subprocess.run(["gh", *args], capture_output=True, text=True, check=True).stdout
+
+          repo, pr = os.environ["REPO"], os.environ["PR"]
+          if not os.environ.get("OPENROUTER_API_KEY"):
+              print("No OPENROUTER_API_KEY available; skipping.")
+              sys.exit(0)
+
+          body = (json.loads(gh("pr", "view", pr, "--repo", repo, "--json", "body"))["body"] or "").replace("\r\n", "\n")
+          blank_markers = ["Linear: \n", "Describe behavior, not files. -->\n-\n"]
+          if body.strip() and not all(m in body for m in blank_markers):
+              print("Description already written; leaving it alone.")
+              sys.exit(0)
+
+          template = body if body.strip() else gh(
+              "api", "repos/atomicglue/.github/contents/.github/PULL_REQUEST_TEMPLATE.md",
+              "-H", "Accept: application/vnd.github.raw")
+
+          files = json.loads(gh("pr", "view", pr, "--repo", repo, "--json", "files"))["files"]
+          file_list = "\n".join(f"{f['path']} (+{f['additions']}/-{f['deletions']})" for f in files)
+          diff = gh("pr", "diff", pr, "--repo", repo)
+          limit = int(os.environ["MAX_DIFF_CHARS"])
+          truncated = len(diff) > limit
+          diff = diff[:limit]
+
+          m = re.search(r"([a-z]{2,10})-(\d+)", os.environ.get("BRANCH", ""), re.I)
+          linear_id = f"{m.group(1).upper()}-{m.group(2)}" if m else ""
+
+          instructions = f"""Fill in this pull request description template using the diff below.
+          Rules:
+          - Keep every heading and HTML comment from the template exactly as written.
+          - Linear line: use "{linear_id or 'none found in branch name'}".
+          - What changed: 3 to 5 plain-language bullets about behavior, not file names.
+          - Risk tier: check exactly one box. Choose High if the diff touches authentication, client data, payments, infrastructure, environment variables, dependencies or lock files, CI or deploy configuration.
+          - Reviewer checklist: 2 to 5 specific, verifiable checks a reviewer can actually perform for this change. Never write vague checks like "check that it works".
+          - Leave the three High-risk-only checklist items unchecked and unchanged.
+          - Files that matter: list the files a reviewer should read under Review, and lock files, generated files and snapshots under Skip.
+          - How to test: concrete steps. Leave "Preview:" empty if no preview URL is known.
+          - Rollback: check the option that fits; add a short note under Other only if neither fits.
+          - Add this line directly under the first heading: "**Draft: author must confirm the risk tier and reviewer checklist before requesting review.**"
+          - Do not mention how this description was produced. Do not use em dashes.
+          - Output only the filled-in markdown, with no preamble.
+          {"- The diff was truncated; say so under Files that matter." if truncated else ""}
+
+          TEMPLATE:
+          {template}
+
+          CHANGED FILES:
+          {file_list}
+
+          DIFF:
+          {diff}
+          """
+
+          req = urllib.request.Request(
+              "https://openrouter.ai/api/v1/chat/completions",
+              data=json.dumps({
+                  "model": os.environ["MODEL"],
+                  "max_tokens": 2000,
+                  "messages": [{"role": "user", "content": instructions}],
+              }).encode(),
+              headers={
+                  "Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}",
+                  "Content-Type": "application/json",
+              },
+          )
+          try:
+              with urllib.request.urlopen(req, timeout=120) as r:
+                  out = json.load(r)["choices"][0]["message"]["content"].strip()
+          except Exception as e:
+              print(f"Model call failed: {e}; leaving description unchanged.")
+              sys.exit(0)
+
+          if "## Why" not in out:
+              print("Model output did not match the template; leaving description unchanged.")
+              sys.exit(0)
+
+          with open("body.md", "w") as f:
+              f.write(out + "\n")
+          gh("pr", "edit", pr, "--repo", repo, "--body-file", "body.md")
+          print("Description filled.")
+          PY
